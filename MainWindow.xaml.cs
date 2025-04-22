@@ -1,65 +1,170 @@
-﻿using CopyFilesWPF.Presenter;
+﻿using CopyFilesWPF.Model;
 using CopyFilesWPF.View;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Threading;
 using System.Windows;
 using System.Windows.Controls;
-using System.Windows.Forms;
+using System.Windows.Threading;
 
-namespace CopyFilesWPF
+namespace CopyFilesWPF.Presenter
 {
-    public partial class MainWindow : Window, IMainWindowView
+    public class MainWindowPresenter : IMainWindowPresenter
     {
-        private readonly IMainWindowPresenter _mainWindowPresenter;
-        public MainWindow MainWindowView => this;
+        private readonly IMainWindowView _mainWindowView;
+        private readonly MainWindowModel _mainWindowModel;
+        private readonly Dictionary<Grid, CancellationTokenSource> _copyProcesses = new();
 
-        public MainWindow()
+        public MainWindowPresenter(IMainWindowView mainWindowView)
         {
-            InitializeComponent();
-            _mainWindowPresenter = new MainWindowPresenter(this);
+            _mainWindowView = mainWindowView;
+            _mainWindowModel = new MainWindowModel();
         }
 
-        private void FromButton_Click(object sender, RoutedEventArgs e)
+        public void ChooseFileFromButtonClick(string path)
         {
-            FromTextBox.Text = OpenFile();
-            _mainWindowPresenter.ChooseFileFromButtonClick(FromTextBox.Text);
+            _mainWindowModel.FilePath.PathFrom = path;
         }
 
-        private void ToButton_Click(object sender, RoutedEventArgs e)
+        public void ChooseFileToButtonClick(string path)
         {
-            using var dialog = new FolderBrowserDialog(); // for this type - please turn on WinForms in project (in properties)
-            DialogResult result = dialog.ShowDialog();
-            ToTextBox.Text = dialog.SelectedPath;
-            _mainWindowPresenter.ChooseFileToButtonClick(ToTextBox.Text);
+            _mainWindowModel.FilePath.PathTo = path;
         }
 
-        private void CopyButton_Click(object sender, RoutedEventArgs e)
+        public void CopyButtonClick()
         {
-            _mainWindowPresenter.CopyButtonClick();
+            string pathFrom = _mainWindowView.MainWindowView.FromTextBox.Text;
+            string pathTo = _mainWindowView.MainWindowView.ToTextBox.Text;
+
+            if (string.IsNullOrWhiteSpace(pathFrom) || string.IsNullOrWhiteSpace(pathTo))
+                return;
+
+            _mainWindowModel.FilePath.PathFrom = pathFrom;
+            _mainWindowModel.FilePath.PathTo = pathTo;
+
+            ClearPathInputs();
+            AddFileCopyUI(Path.GetFileName(pathFrom), out Grid copyPanel, out ProgressBar progressBar, out Button pauseResumeButton, out Button cancelButton);
+
+            var cts = new CancellationTokenSource();
+            var fileCopier = new FileCopier(cts.Token);
+            copyPanel.Tag = fileCopier;
+            _copyProcesses[copyPanel] = cts;
+
+            pauseResumeButton.Click += (s, e) => TogglePause(fileCopier, pauseResumeButton);
+            cancelButton.Click += (s, e) => CancelCopy(copyPanel, cancelButton);
+
+            _mainWindowModel.CopyFile(
+                (percent, ref bool _) => UpdateProgressUI(copyPanel, percent),
+                () => OnCopyComplete(copyPanel),
+                fileCopier
+            );
         }
 
-        private void FromTextBox_TextChanged(object sender, TextChangedEventArgs e)
+        private void ClearPathInputs()
         {
-            CopyButton.IsEnabled = CheckFromAndToPaths();
+            _mainWindowView.MainWindowView.FromTextBox.Text = string.Empty;
+            _mainWindowView.MainWindowView.ToTextBox.Text = string.Empty;
         }
 
-        private void ToTextBox_TextChanged(object sender, TextChangedEventArgs e)
+        private void AddFileCopyUI(string fileName, out Grid panel, out ProgressBar progressBar, out Button pauseButton, out Button cancelButton)
         {
-            CopyButton.IsEnabled = CheckFromAndToPaths();
-        }
+            _mainWindowView.MainWindowView.Height += 60;
 
-        private bool CheckFromAndToPaths()
-        {
-            return ToTextBox.Text.Length > 0 && FromTextBox.Text.Length > 0;
-        }
+            panel = new Grid { Height = 60 };
+            panel.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(320) });
+            panel.ColumnDefinitions.Add(new ColumnDefinition());
+            panel.ColumnDefinitions.Add(new ColumnDefinition());
+            panel.RowDefinitions.Add(new RowDefinition { Height = new GridLength(20) });
+            panel.RowDefinitions.Add(new RowDefinition());
 
-        private static string OpenFile()
-        {
-            var openFile = new OpenFileDialog
+            var fileNameBlock = new TextBlock
             {
-                Multiselect = false
+                Text = fileName,
+                Margin = new Thickness(5, 0, 5, 0)
             };
-            openFile.ShowDialog();
+            Grid.SetRow(fileNameBlock, 0);
+            Grid.SetColumn(fileNameBlock, 0);
+            panel.Children.Add(fileNameBlock);
 
-            return openFile.FileName;
+            progressBar = new ProgressBar { Margin = new Thickness(10) };
+            Grid.SetRow(progressBar, 1);
+            Grid.SetColumn(progressBar, 0);
+            panel.Children.Add(progressBar);
+
+            pauseButton = new Button { Content = "Pause", Margin = new Thickness(5) };
+            Grid.SetRow(pauseButton, 1);
+            Grid.SetColumn(pauseButton, 1);
+            panel.Children.Add(pauseButton);
+
+            cancelButton = new Button { Content = "Cancel", Margin = new Thickness(5) };
+            Grid.SetRow(cancelButton, 1);
+            Grid.SetColumn(cancelButton, 2);
+            panel.Children.Add(cancelButton);
+
+            DockPanel.SetDock(panel, Dock.Top);
+            _mainWindowView.MainWindowView.MainPanel.Children.Add(panel);
+        }
+
+        private void TogglePause(FileCopier fileCopier, Button pauseButton)
+        {
+            pauseButton.IsEnabled = false;
+
+            if (pauseButton.Content.ToString() == "Pause")
+            {
+                fileCopier.Pause();
+                pauseButton.Content = "Resume";
+            }
+            else
+            {
+                fileCopier.Resume();
+                pauseButton.Content = "Pause";
+            }
+
+            pauseButton.IsEnabled = true;
+        }
+
+        private void CancelCopy(Grid panel, Button cancelButton)
+        {
+            cancelButton.IsEnabled = false;
+
+            if (_copyProcesses.TryGetValue(panel, out var cts))
+            {
+                cts.Cancel();
+                _copyProcesses.Remove(panel);
+            }
+
+            if (panel.Tag is FileCopier fileCopier)
+            {
+                fileCopier.Cancel();
+            }
+        }
+
+        private void UpdateProgressUI(Grid panel, double percentage)
+        {
+            _mainWindowView.MainWindowView.Dispatcher.BeginInvoke(DispatcherPriority.Normal, new ThreadStart(() =>
+            {
+                foreach (var element in panel.Children)
+                {
+                    if (element is ProgressBar bar)
+                    {
+                        bar.Value = percentage;
+                    }
+                }
+            }));
+        }
+
+        private void OnCopyComplete(Grid panel)
+        {
+            _mainWindowView.MainWindowView.Dispatcher.BeginInvoke(DispatcherPriority.Normal, new ThreadStart(() =>
+            {
+                _mainWindowView.MainWindowView.Height -= 60;
+                _mainWindowView.MainWindowView.MainPanel.Children.Remove(panel);
+                _mainWindowView.MainWindowView.CopyButton.IsEnabled = true;
+
+                if (_copyProcesses.ContainsKey(panel))
+                    _copyProcesses.Remove(panel);
+            }));
         }
     }
 }

@@ -2,96 +2,110 @@
 using System.IO;
 using System.Threading;
 using System.Windows;
-using System.Windows.Controls;
 
 namespace CopyFilesWPF.Model
 {
+    /// <summary>
+    /// Копіює файли з підтримкою прогресу, паузи та скасування.
+    /// </summary>
     public class FileCopier
     {
-        private readonly Grid _gridPanel;
         private readonly FilePath _filePath;
+        private readonly CancellationToken _cancellationToken;
+        private readonly ManualResetEventSlim _pauseEvent = new(true);
 
-        public delegate void ProgressChangeDelegate(double progress, ref bool cancel, Grid gridPanel);
-        public delegate void CompleteDelegate(Grid gridPanel);
-        public event ProgressChangeDelegate OnProgressChanged;
-        public event CompleteDelegate OnComplete;
+        /// <summary>
+        /// Подія, яка викликається при зміні прогресу копіювання (від 0 до 100).
+        /// </summary>
+        public event Action<double> ProgressChanged;
 
-        public bool CancelFlag = false;
-        public ManualResetEvent PauseFlag = new(true);
+        /// <summary>
+        /// Подія, яка викликається після завершення копіювання.
+        /// </summary>
+        public event Action CopyCompleted;
 
-        public FileCopier(
-            FilePath filePath,
-            ProgressChangeDelegate onProgressChange,
-            CompleteDelegate onComplete,
-            Grid gridPanel)
+        public FileCopier(FilePath filePath, CancellationToken cancellationToken)
         {
-            OnProgressChanged += onProgressChange;
-            OnComplete += onComplete;
-            _filePath = filePath;
-            _gridPanel = gridPanel;
+            _filePath = filePath ?? throw new ArgumentNullException(nameof(filePath));
+            _cancellationToken = cancellationToken;
         }
+
+        public void Pause() => _pauseEvent.Reset();
+        public void Resume() => _pauseEvent.Set();
 
         public void CopyFile()
         {
-            byte[] buffer = new byte[1024 * 1024];
-            bool isCopy = true; // переделать решение на использование CancellationToken
+            const int bufferSize = 1024 * 1024;
+            byte[] buffer = new byte[bufferSize];
 
-            while (isCopy)
+            while (true)
             {
                 try
                 {
-                    using(var source = new FileStream(_filePath.PathFrom, FileMode.Open, FileAccess.Read))
+                    using var source = new FileStream(_filePath.PathFrom, FileMode.Open, FileAccess.Read);
+                    using var destination = new FileStream(_filePath.PathTo, FileMode.CreateNew, FileAccess.Write);
+
+                    long totalBytes = 0;
+                    long fileLength = source.Length;
+
+                    int bytesRead;
+                    while ((bytesRead = source.Read(buffer, 0, buffer.Length)) > 0)
                     {
-                        var fileLength = source.Length;
-                        using var destination = new FileStream(_filePath.PathTo, FileMode.CreateNew, FileAccess.Write);
-                        long totalBytes = 0;
-                        int currentBlockSize = 0;
-                        while ((currentBlockSize = source.Read(buffer, 0, buffer.Length)) > 0)
-                        {
-                            totalBytes += currentBlockSize;
-                            double persentage = totalBytes * 100.0 / fileLength;
-                            destination.Write(buffer, 0, currentBlockSize);
-                            OnProgressChanged(persentage, ref CancelFlag, _gridPanel);
+                        _cancellationToken.ThrowIfCancellationRequested();
+                        _pauseEvent.Wait(_cancellationToken);
 
-                            if(CancelFlag == true)
-                            {
-                                File.Delete(_filePath.PathTo);
-                                isCopy = false;
-                                break;
-                            }
+                        destination.Write(buffer, 0, bytesRead);
+                        totalBytes += bytesRead;
 
-                            CancelFlag = false; // переделать решение на использование CancellationToken
-                            PauseFlag.WaitOne(Timeout.Infinite); // переделать на thread suspend
-                        }
+                        double progress = totalBytes * 100.0 / fileLength;
+                        ProgressChanged?.Invoke(progress);
                     }
-                    isCopy = false;
+
+                    break; // success
                 }
-                catch (IOException error)
+                catch (OperationCanceledException)
                 {
-                    // порефакторить код ниже
-                    if (!CancelFlag)
-                    {
-                        var result = MessageBox.Show(error.Message + " Replace?", "Replace?", MessageBoxButton.YesNo, MessageBoxImage.Question);
-                        isCopy = result == MessageBoxResult.Yes;
-
-                        if (isCopy)
-                        {
-                            File.Delete(_filePath.PathTo);
-                        }
-                    }
-                    else
-                    {
-                        var result = MessageBox.Show(error.Message + " Copying was canceled!", "Cancel", MessageBoxButton.OK, MessageBoxImage.Asterisk);
-                        isCopy = false;
-                        File.Delete(_filePath.PathTo);
-                    }
+                    TryDeleteFile(_filePath.PathTo);
+                    MessageBox.Show("Copying was canceled!", "Canceled", MessageBoxButton.OK, MessageBoxImage.Information);
+                    break;
                 }
-                catch (Exception error)
+                catch (IOException ex)
                 {
-                    MessageBox.Show(error.Message, "Error occured!", MessageBoxButton.OK, MessageBoxImage.Error);
+                    var result = MessageBox.Show(
+                        $"{ex.Message}\n\nFile already exists. Replace it?",
+                        "File Exists",
+                        MessageBoxButton.YesNo,
+                        MessageBoxImage.Question);
+
+                    if (result == MessageBoxResult.Yes)
+                    {
+                        TryDeleteFile(_filePath.PathTo);
+                        continue;
+                    }
+
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show(ex.Message, "Unexpected Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                    break;
                 }
             }
-            OnComplete(_gridPanel);
+
+            CopyCompleted?.Invoke();
+        }
+
+        private static void TryDeleteFile(string path)
+        {
+            try
+            {
+                if (File.Exists(path))
+                    File.Delete(path);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Could not delete file: {ex.Message}", "Cleanup Error", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
         }
     }
 }
